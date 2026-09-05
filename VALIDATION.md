@@ -82,3 +82,24 @@ RSSはprocess全体の生涯peakです。Task数・待機方法・handle保持�
 - CPython 3.14.7 free-threaded buildのGIL無効・有効の両設定で37 testsを実行。
 - `.github/workflows/test.yml`を追加。通常CPython 3.11〜3.14と3.14t（GIL無効/有効）でunittestとcompileallを実行する構成。
 - NetPollerのread/write同時waitと、I/O timeoutの共通timer heap化は実装していない。責務と世代/cancel管理が複雑になるため、既存のfdごと1 waiterと線形timeout走査を維持し、READMEに制約を明記。
+
+## Work Stealing専用benchmark
+
+実行環境はmacOS 26.3.1 arm64、logical CPU 10、uv管理のCPython 3.14.7 free-threaded build、`PYTHON_GIL=0`。parentが24 childをdynamic spawnし、heavy 6 Taskは1,000,000 iteration、light 18 Taskは100,000 iterationとした。各caseはfresh processで1回ずつ実行した観測値であり、性能の保証値ではない。
+
+```sh
+PYTHONPATH=src PYTHON_GIL=0 .venv/bin/python -m benchmarks.compare \
+  --suite stealing --workers 1 2 4 --tasks 24 --heavy-tasks 6 \
+  --iterations 1000000 --light-iterations 100000 --repeats 1
+```
+
+| runtime | Workers | completed | steals_succeeded | elapsed (s) | CPU / wall |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| shared queue M:N | 1 | 25 | 0 | 0.2357 | 0.9994 |
+| shared queue M:N | 2 | 25 | 0 | 0.1896 | 1.2487 |
+| shared queue M:N | 4 | 25 | 0 | 0.0887 | 3.1165 |
+| WorkStealingRuntime | 1 | 25 | 0 | 0.2456 | 0.9997 |
+| WorkStealingRuntime | 2 | 25 | 4 | 0.1838 | 1.2915 |
+| WorkStealingRuntime | 4 | 25 | 12 | 0.0938 | 2.7333 |
+
+複数WorkerのWorkStealingRuntimeで実stealを確認した。1 Workerでstealが0なのは期待どおり。shared queue版はstealという操作自体を持たない。今回の値では両方式の明確な優劣はなく、専用benchmarkの判定対象は完了・checksum・Task IDの一意性と、複数Worker時の`steals_succeeded > 0`である。

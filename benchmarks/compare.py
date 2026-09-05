@@ -11,10 +11,12 @@ from .common import positive
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--suite', choices=['cpu', 'tasks'], default='cpu')
+    parser.add_argument('--suite', choices=['cpu', 'tasks', 'stealing'], default='cpu')
     parser.add_argument('--repeats', type=positive, default=3)
     parser.add_argument('--tasks', type=positive, default=8)
     parser.add_argument('--iterations', type=positive, default=1_000_000)
+    parser.add_argument('--heavy-tasks', type=positive, default=6)
+    parser.add_argument('--light-iterations', type=positive, default=100_000)
     parser.add_argument('--workers', type=positive, nargs='+', default=[1, 2, 4])
     parser.add_argument('--green-tasks', type=positive, default=100_000)
     parser.add_argument('--thread-tasks', type=positive, default=100)
@@ -28,6 +30,14 @@ def main():
         cases = [('m1', ['benchmarks.cpu', '--mode', 'm1', *common])]
         cases += [(f'mn-{n}', ['benchmarks.cpu', '--mode', 'mn', '--workers', str(n), *common]) for n in args.workers]
         cases += [(f'ws-{n}', ['benchmarks.cpu', '--mode', 'ws', '--workers', str(n), *common]) for n in args.workers]
+    elif args.suite == 'stealing':
+        common = ['--tasks', str(args.tasks), '--heavy-tasks', str(args.heavy_tasks),
+                  '--heavy-iterations', str(args.iterations),
+                  '--light-iterations', str(args.light_iterations)]
+        cases = [(f'mn-{n}', ['benchmarks.stealing', '--mode', 'mn', '--workers', str(n), *common])
+                 for n in args.workers]
+        cases += [(f'ws-{n}', ['benchmarks.stealing', '--mode', 'ws', '--workers', str(n), *common])
+                  for n in args.workers]
     else:
         cases = [('threads', ['examples.os_threads', '--tasks', str(args.thread_tasks)]),
                  ('m1-small', ['examples.m1_many', '--tasks', str(args.thread_tasks)]),

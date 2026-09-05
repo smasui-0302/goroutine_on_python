@@ -262,7 +262,7 @@ GoのG/M/Pとruntimeの構成は[Go runtime開発資料](https://go.dev/src/runt
 
 ## Phase 8: Local Queue + Work Stealing
 
-shared queue版の`MNRuntime`は、すべてのyield・取得で1本のqueueを共有します。設計が明快な一方、free-threaded PythonでWorkerが同時実行すると同じlockへのアクセスが集中します。比較用の`MNRuntime`はそのまま残し、`WorkStealingRuntime`を追加しました。
+shared queue版の`MNRuntime`は、すべてのyield・取得で1本のqueueを共有します。設計が明快な一方、free-threaded PythonでWorkerが同時実行すると同じlockへのアクセスが集中します。比較用の`MNRuntime`はそのまま残し、scheduling policyを比較する`WorkStealingRuntime`を追加しました。
 
 ```text
                   Global Queue
@@ -276,12 +276,17 @@ shared queue版の`MNRuntime`は、すべてのyield・取得で1本のqueueを�
 
 Workerは自分のlocal queue、global queue、他Workerのlocal queueの順に探します。root Taskとtimer/I/Oから復帰したTaskはglobal queueへ入り、Taskがyieldした場合とdynamic spawnしたchildは現在のWorkerのlocal queueへ入ります。stealはvictimの反対側から1 Taskずつ取得します。すべてのqueueとTask lifecycleは同じ`Condition`で保護し、仕事がなければbusy loopせず待機します。
 
+このlocal queueはWorkerごとに分かれていますが、**local queueを含む全queue操作とTask lifecycleは共通の`Scheduler._condition`配下**です。したがって、この実装が再現するのはTask locality、負荷の偏り、stealによるWorker間のTask再配置というpolicyです。global lock contentionの大幅な削減や、lock競合を抑えるqueue構造そのものは再現していません。Go runtimeはProcessorごとのrun queueに対して、より細かな同期と高度なqueue構造を利用します。
+
 ```sh
 uv run python -m examples.work_stealing_demo --workers 4 --tasks 10000
 PYTHON_GIL=0 uv run python -m benchmarks.compare --suite cpu --workers 1 2 4 --iterations 5000000 --repeats 3 > benchmark-results-work-stealing.jsonl
+PYTHON_GIL=0 uv run python -m benchmarks.compare --suite stealing --workers 1 2 4 --tasks 24 --heavy-tasks 6 --iterations 1000000 --light-iterations 100000 --repeats 3 > benchmark-results-stealing.jsonl
 ```
 
-demoはparentがchildをlocal queueへ連続spawnし、他Workerが実際にstealできる偏りを作ります。`steals_attempted`、`steals_succeeded`、`local_queue_hits`、`global_queue_hits`を確認してください。CPU benchmarkの各JSONにはこれらと`migrations`、`elapsed_s`、`cpu_to_wall`が含まれます。workloadやqueue競合によって結果は変わるため、shared queueとwork stealingのどちらが常に速いとは断定できません。
+`benchmarks.stealing`はroot Taskを均等投入せず、parentがheavy/light childをdynamic spawnします。複数Worker時は最初のchildがowner Workerで待機し、別Workerがparentを取得してspawnを進める偏りを意図的に作ります。WorkStealingRuntimeではこの進行に実stealが必要なので、`steals_succeeded`が増えます。shared queue版M:Nと各Worker数をfresh processで実行し、JSONの`elapsed_s`、`process_cpu_s`、`cpu_to_wall`、完了数、migration、queue/steal統計を比較できます。
+
+このbenchmarkの目的は、負荷不均衡時にstealが起き、TaskがWorker間へ再配置されることの観察です。shared queueとwork stealingのどちらが常に高速というわけではありません。結果はworkloadの偏り、Task粒度、Worker数、共通queue lock、Python runtimeによって変わります。現在のWorkStealingRuntimeは共通`Condition`を使うため、Go runtimeと同じlock contention特性を測るbenchmarkではありません。
 
 Go runtimeはProcessorごとのrun queue、global queue、複数Task単位のsteal、syscall・netpoller・preemptionとの統合を持ちます。この実装はlocalityと負荷分散を観察する最小モデルで、Processorや強制preemptionはありません。
 
