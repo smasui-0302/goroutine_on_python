@@ -1,6 +1,6 @@
 """nonblocking socket用のgenerator helper。readinessは完了通知ではない。"""
 import time
-from .task import wait_read, wait_write
+from .task import validate_timeout, wait_read, wait_write
 
 
 def _remaining(deadline):
@@ -13,6 +13,7 @@ def _remaining(deadline):
 
 
 def recv(sock, size, *, timeout=None):
+    timeout = validate_timeout(timeout)
     if sock.getblocking():
         raise ValueError("setblocking(False)が必要です")
     deadline = None if timeout is None else time.monotonic() + timeout
@@ -24,6 +25,7 @@ def recv(sock, size, *, timeout=None):
 
 
 def send_all(sock, data, *, timeout=None):
+    timeout = validate_timeout(timeout)
     if sock.getblocking():
         raise ValueError("setblocking(False)が必要です")
     deadline = None if timeout is None else time.monotonic() + timeout

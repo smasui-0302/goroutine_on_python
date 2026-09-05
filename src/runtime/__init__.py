@@ -2,6 +2,10 @@
 from .m1 import Runtime
 from .mn import Runtime as MNRuntime
 from .scheduler import TaskErrors
-from .task import State, Task, gosched, wait_read, wait_write
+from .task import State, Task, gosched, sleep, spawn, wait_read, wait_write
+from .workstealing import WorkStealingRuntime
 
-__all__ = ['Runtime', 'MNRuntime', 'Task', 'State', 'TaskErrors', 'gosched', 'wait_read', 'wait_write']
+__all__ = [
+    'Runtime', 'MNRuntime', 'WorkStealingRuntime', 'Task', 'State', 'TaskErrors',
+    'gosched', 'sleep', 'spawn', 'wait_read', 'wait_write',
+]

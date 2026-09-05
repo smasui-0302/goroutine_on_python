@@ -1,0 +1,59 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  cpython:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.12', '3.13', '3.14']
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: unittest
+        env:
+          PYTHONPATH: src
+        run: python -m unittest discover -s tests -v
+      - name: compileall
+        run: python -m compileall -q src examples benchmarks tests
+
+  free-threaded:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        gil: ['0', '1']
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.14t'
+      - name: Verify build and GIL mode
+        env:
+          PYTHON_GIL: ${{ matrix.gil }}
+        run: |
+          python - <<'PY'
+          import os
+          import sys
+          import sysconfig
+          assert sysconfig.get_config_var('Py_GIL_DISABLED') == 1
+          assert sys._is_gil_enabled() is (os.environ['PYTHON_GIL'] == '1')
+          PY
+      - name: unittest
+        env:
+          PYTHONPATH: src
+          PYTHON_GIL: ${{ matrix.gil }}
+        run: python -m unittest discover -s tests -v
+      - name: compileall
+        env:
+          PYTHON_GIL: ${{ matrix.gil }}
+        run: python -m compileall -q src examples benchmarks tests

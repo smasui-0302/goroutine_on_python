@@ -68,3 +68,17 @@ RSSはprocess全体の生涯peakです。Task数・待機方法・handle保持�
 - `Py_GIL_DISABLED=1`、`sys._is_gil_enabled()=False` を確認。
 - `PYTHONPATH=src PYTHON_GIL=0 .venv/bin/python -m unittest discover -s tests -v`: 24 testsがpass。
 - `PYTHONPATH=src PYTHON_GIL=0 .venv/bin/python -m benchmarks.compare --suite cpu --iterations 5000000 --workers 1 2 4 --repeats 3`: M:1=0.8278秒、M:N 2=0.4232秒（1.956倍）、M:N 4=0.2412秒（3.432倍）。
+
+## Phase 8〜10の追加検証
+
+- `Exception`と`BaseException`を分離し、ValueErrorの隔離、KeyboardInterrupt/SystemExitの伝播、残存generator・Worker・poller・timerのcleanupをtest。
+- `WorkStealingRuntime`を1 Workerと4 Workerでtestし、dynamic spawnで意図的にlocal queueを偏らせたscenarioで実stealを確認。
+- `examples.work_stealing_demo --workers 4 --tasks 10000`: completed=10001、spawned=10000、steals_succeededを観測。
+- `examples.sleep_demo`: 1 Workerでsleep中にrunnable Taskが完了し、deadline後にsleeperが復帰。
+- `examples.spawn_demo`: parent → child → grandchildをruntime中に登録して3 Task完了。
+- CPU比較へwork stealingを追加。JSONでelapsed、CPU / wall、migrations、steal/local/global queue統計を出力。
+- free-threaded・GIL無効で2反復したCPU比較のmedianは、M:1=0.1644秒、M:N 2 Worker=0.0847秒、M:N 4 Worker=0.0480秒、work stealing 2 Worker=0.0888秒、work stealing 4 Worker=0.0539秒。短い測定なので傾向確認用。
+- 通常CPython 3.13.5で37 testsがpass。
+- CPython 3.14.7 free-threaded buildのGIL無効・有効の両設定で37 testsを実行。
+- `.github/workflows/test.yml`を追加。通常CPython 3.11〜3.14と3.14t（GIL無効/有効）でunittestとcompileallを実行する構成。
+- NetPollerのread/write同時waitと、I/O timeoutの共通timer heap化は実装していない。責務と世代/cancel管理が複雑になるため、既存のfdごと1 waiterと線形timeout走査を維持し、READMEに制約を明記。

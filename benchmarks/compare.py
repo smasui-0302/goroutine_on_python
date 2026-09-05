@@ -27,6 +27,7 @@ def main():
         common = ['--tasks', str(args.tasks), '--iterations', str(args.iterations)]
         cases = [('m1', ['benchmarks.cpu', '--mode', 'm1', *common])]
         cases += [(f'mn-{n}', ['benchmarks.cpu', '--mode', 'mn', '--workers', str(n), *common]) for n in args.workers]
+        cases += [(f'ws-{n}', ['benchmarks.cpu', '--mode', 'ws', '--workers', str(n), *common]) for n in args.workers]
     else:
         cases = [('threads', ['examples.os_threads', '--tasks', str(args.thread_tasks)]),
                  ('m1-small', ['examples.m1_many', '--tasks', str(args.thread_tasks)]),

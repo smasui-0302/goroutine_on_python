@@ -4,6 +4,8 @@ PythonのgeneratorをTaskとして、自作のrun queueで動かす学習用プ�
 
 出発点は[「goroutineを作ってみる。Rustで」](https://www.m3tech.blog/entry/build-your-own-goroutine-in-rust)です。元記事の専用スタック・レジスタ切り替えを移植するのではなく、generatorの停止・再開に置き換え、スケジューリングとI/O待ちを実験できるようにしました。元記事のRust実装にはnetpollerは含まれず、後半でその必要性が説明されています。
 
+READMEは、OS Thread → M:1 → 100,000 Tasks → M:N shared queue → GIL → free-threaded Python → netpoller → local queue + work stealing → timer queue → dynamic spawn → Go runtimeとの差、というPhase順で読み進められます。timerを先に理解したい場合は、Phase 7の次にPhase 9を読み、Phase 8へ戻ると、netpoller → timer queue → local queueの順でも追えます。
+
 ## 最初に実行する
 
 macOSでHomebrewがある場合は、まずuvを導入します。導入済みならこのコマンドは不要です。他OSの導入方法は[uv公式installation guide](https://docs.astral.sh/uv/getting-started/installation/)を参照してください。
@@ -54,11 +56,14 @@ Task 3: end
 | `src/runtime/scheduler.py` | queue、Task所有権、完了判定、例外・終了処理 |
 | `src/runtime/m1.py` | 呼び出し元threadで実行するM:1 |
 | `src/runtime/mn.py` | N個のWorkerで実行するM:N |
+| `src/runtime/workstealing.py` | Worker別local queueとwork stealing |
 | `src/runtime/netpoller.py` | Selectorの登録、ready通知、I/O timeout |
+| `src/runtime/timer.py` | cooperative sleepのdeadline min-heap |
 | `src/runtime/io.py` | nonblocking recv / partial sendを扱うhelper |
 | `examples/` | 各phaseの実行可能なdemo |
 | `benchmarks/` | 計測、fresh processでの比較、asyncio baseline |
-| `tests/test_runtime.py` | 正常動作・競合・I/O・失敗時の終了のtest |
+| `tests/test_runtime.py` | Phase 1〜7の正常動作・競合・I/O・失敗時の終了のtest |
+| `tests/test_advanced_runtime.py` | BaseException、work stealing、timer、spawn、timeoutのtest |
 
 まず `examples/m1_demo.py`、`task.py`、`scheduler.py` の `_worker_loop()` を読むと、Taskを取り出し、1回再開し、queueへ戻す流れを追えます。
 
@@ -249,21 +254,92 @@ GoのG/M/Pとruntimeの構成は[Go runtime開発資料](https://go.dev/src/runt
 
 ### 再現できた部分 / できない部分
 
-- 再現: 軽量Taskの大量登録、run queue、協調的な実行権譲渡、M:1 / M:N、Worker間のTask移動、I/O待ちと実行の分離。
+- 再現: 軽量Taskの大量登録、run queue、協調的な実行権譲渡、M:1 / M:N、Worker別local queueとwork stealing、Worker間のTask移動、I/O待ちと実行の分離。
 - 置き換え: 専用native stackとregister保存の代わりにgeneratorとPython実行状態を利用。元記事のcontext switchコストそのものは測れません。
 - 非再現: 普通の関数の任意の深さから透過的に停止するstackful coroutine。Python版では停止可能な呼び出しを `yield from` でつなぎます。
-- 非再現: 強制preemption、伸長するnative stack、G/M/P、work stealing、blocking syscallの自動変換。Pure Pythonから任意の処理を安全に中断する機能はありません。
+- 非再現: 強制preemption、伸長するnative stack、Goと同等のG/M/P・複数Task単位のsteal・blocking syscallの自動変換。Pure Pythonから任意の処理を安全に中断する機能はありません。
 - 制約: M:Nの構造を再現しても、通常CPythonではpure-Python CPU計算のマルチコア並列性は得られません。
+
+## Phase 8: Local Queue + Work Stealing
+
+shared queue版の`MNRuntime`は、すべてのyield・取得で1本のqueueを共有します。設計が明快な一方、free-threaded PythonでWorkerが同時実行すると同じlockへのアクセスが集中します。比較用の`MNRuntime`はそのまま残し、`WorkStealingRuntime`を追加しました。
+
+```text
+                  Global Queue
+                       │
+              ┌────────┴────────┐
+              ▼                 ▼
+          Local Q 0         Local Q 1
+              │                 │
+          Worker 0  ← steal → Worker 1
+```
+
+Workerは自分のlocal queue、global queue、他Workerのlocal queueの順に探します。root Taskとtimer/I/Oから復帰したTaskはglobal queueへ入り、Taskがyieldした場合とdynamic spawnしたchildは現在のWorkerのlocal queueへ入ります。stealはvictimの反対側から1 Taskずつ取得します。すべてのqueueとTask lifecycleは同じ`Condition`で保護し、仕事がなければbusy loopせず待機します。
+
+```sh
+uv run python -m examples.work_stealing_demo --workers 4 --tasks 10000
+PYTHON_GIL=0 uv run python -m benchmarks.compare --suite cpu --workers 1 2 4 --iterations 5000000 --repeats 3 > benchmark-results-work-stealing.jsonl
+```
+
+demoはparentがchildをlocal queueへ連続spawnし、他Workerが実際にstealできる偏りを作ります。`steals_attempted`、`steals_succeeded`、`local_queue_hits`、`global_queue_hits`を確認してください。CPU benchmarkの各JSONにはこれらと`migrations`、`elapsed_s`、`cpu_to_wall`が含まれます。workloadやqueue競合によって結果は変わるため、shared queueとwork stealingのどちらが常に速いとは断定できません。
+
+Go runtimeはProcessorごとのrun queue、global queue、複数Task単位のsteal、syscall・netpoller・preemptionとの統合を持ちます。この実装はlocalityと負荷分散を観察する最小モデルで、Processorや強制preemptionはありません。
+
+## Phase 9: Timer Queue / cooperative sleep
+
+Task内の`time.sleep()`はそのTaskを実行しているWorkerごと止めます。`yield sleep(seconds)`はTaskをWAITINGへ移し、Workerを別Taskへ返します。
+
+```python
+from runtime import sleep
+
+def task():
+    yield sleep(0.1)
+    print("ready")
+```
+
+```sh
+uv run python -m examples.sleep_demo
+```
+
+初回のSleepで専用timer threadを起動します。`heapq`のmin-heapへ`(deadline, sequence, task)`を積み、最短deadlineまで待ち、期限到達後にTaskをREADYとしてrun queueへ戻します。`sleep_waits`と、demoで`sleeper: end`より先にrunnable Taskが完了する順序を観測できます。M:1でもTask実行Workerはblockingしません。
+
+I/O timeoutは現在もNetPoller内で管理しています。sleepとI/O timeoutを1つのtimer heapへ統合するとcancel tokenやregistration世代の管理が必要になるため、教材として責務を分離しました。Go runtimeではtimer、scheduler、netpollerがより密接に連携し、多数のtimerとnetwork待ちを扱います。
+
+## Phase 10: Dynamic Task Spawn
+
+start前の`runtime.go()`だけでは、実行結果に応じた並行処理を作れません。Task内で`yield spawn(generator)`を行うと、Schedulerがchildをactive集合へ追加し、parentとchildをともにREADYへ戻します。
+
+```python
+from runtime import spawn
+
+def child():
+    yield
+    return 42
+
+def parent():
+    child_task = yield spawn(child())
+    print("child id:", child_task.id)
+```
+
+```sh
+uv run python -m examples.spawn_demo
+```
+
+yield式の戻り値はchildのTask handleです。childはparentの`contextvars.Context`をcopyし、重複しないTask idを受け取ります。active Task数にはchild・grandchildも含まれるため、runtimeは動的に生成された全TaskがDONE/FAILEDになるまで終了しません。childの通常の`Exception`はそのchildだけをFAILEDにし、最後に`TaskErrors`へ集約します。
+
+M:1とshared queue M:Nではparent・childをshared queue末尾へ置きます。WorkStealingRuntimeでは現在Workerのlocal queueへ置くため、他Workerがstealできます。外部threadから実行中の`go()`を呼ぶAPIは提供していません。Goの`go`文は通常関数をstackful goroutineとして起動できますが、この実装ではgeneratorを明示し、spawn自体もyield地点になります。
 
 ## APIの範囲と終了処理
 
-学習用の一回限りのbatch runtimeです。全Taskをstart前に登録し、実行中の `go()`、再実行、個別cancel、join Task、timer sleep、channel、DNS/TLS/accept/connect helperは実装していません。
+学習用の一回限りのbatch runtimeです。root Taskをstart前に登録し、実行中は`yield spawn(...)`でchildを追加できます。外部threadからの実行中`go()`、再実行、個別cancel、Task完了を待つjoin、channel、DNS/TLS/accept/connect helperは実装していません。
 
-Task例外は `task.error` に保持し、他Taskを続行した後に `TaskErrors` を呼び出し元へ返します。`failures` で失敗Taskを参照できます。終了Taskはqueueとactive集合から除外されますが、失敗Taskのtracebackは診断のため保持します。Task handleのstate/result/statisticsは `start_runtime()` の終了後に参照してください。
+`Exception`は`task.error`に保持し、他Taskを続行した後に`TaskErrors`を呼び出し元へ返します。`failures`で失敗Taskを参照できます。KeyboardInterruptやSystemExitなど`Exception`ではない`BaseException`はruntime全体をabortし、Worker・poller・timerを停止して残るgeneratorをcloseした後、元の例外をそのまま伝播します。終了Taskはqueueとactive集合から除外されますが、失敗Taskのtracebackは診断のため保持します。Task handleのstate/result/statisticsは`start_runtime()`の終了後に参照してください。
 
 `start_runtime(timeout=...)` は**yield境界で確認する協調的deadline**です。poller障害や期限超過ではWorkerを停止させ、pollerをjoin・closeし、残るgeneratorをcloseします。停止しない無限loop、blocking socket、停止しないfinallyを強制終了できません。厳密な実行時間上限が必要な実験は別processのtimeoutで保護してください。I/O timeoutなしでpeerが永遠に沈黙すれば、待ち続けるのは仕様です。
 
-同じsocketで同時に待てるTaskは1個だけです（read/write同時waitも非対応）。socketは呼び出し側が所有し、待機中に別threadからcloseせず、完了後にcloseしてください。fdの外部close・再利用を完全に追跡する設計ではありません。netpollerのtimeout検索は学習のため線形走査で、巨大なtimer集合に最適化していません。
+同じsocketで同時に待てるTaskは1個だけです（read/write同時waitも未実装）。同一方向の複数waitも拒否します。方向別waiterへ拡張するにはSelectorのevent mask更新と方向ごとのtimeout/cancel管理が必要なため、P2候補として残しました。socketは呼び出し側が所有し、待機中に別threadからcloseせず、完了後にcloseしてください。fdの外部close・再利用を完全に追跡する設計ではありません。netpollerのtimeout検索は学習のため線形走査で、巨大なI/O timeout集合に最適化していません。
+
+`sleep()`、`wait_read()`、`wait_write()`、`recv()`、`send_all()`のtimeout/delayは、有限の非負数または`None`に統一しています。負数、NaN、inf、bool、数値以外を拒否します。socket操作が即時成功できる場合も、helperは操作前にvalidationします。`start_runtime(timeout=...)`だけは有限の正数が必要です。
 
 ## 検証
 
@@ -272,6 +348,8 @@ uv run python -m unittest discover -s tests -v
 uv run python -m compileall -q src examples benchmarks tests
 ```
 
-testsは完了・再開・round-robin・10万Task・M:Nの重複/欠落・contextvars・I/O ready前後・timeout・partial send/EOF・二重wait拒否・poller障害・thread起動失敗・thread解放を確認します。性能に環境依存の閾値は設定していません。
+testsは従来の完了・再開・round-robin・10万Task・M:N・I/Oに加え、BaseException abort、generator/thread cleanup、deadline順sleep、dynamic spawn、Task id、work stealingの実発生、timeout validationを確認します。性能に環境依存の閾値は設定していません。
+
+GitHub Actionsは通常CPython 3.11〜3.14のmatrixと、CPython 3.14 free-threaded版のGIL無効/有効matrixでunittestとcompileallを実行します。free-threaded版は`actions/setup-python`の`3.14t`を利用します。
 
 benchmarkは同時に走らせず、他のCPU負荷を避けて反復してください。benchmark結果はgit対象外のJSON Linesへ保存できます。今回実行した内容と未検証範囲は `VALIDATION.md` に記録しています。

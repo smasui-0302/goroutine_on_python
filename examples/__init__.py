@@ -1,1 +1,1 @@
-"""実行例: PYTHONPATH=src python3 -m examples.m1_demo"""
+"""実行例: uv run python -m examples.m1_demo"""
